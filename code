@@ -1,0 +1,218 @@
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <Servo.h>
+
+const char* ssid = "your ssid";
+const char* password = "your password";
+
+ESP8266WebServer server(80);
+Servo radarServo;
+
+const int servoPin = D1;  // GPIO5
+const int trigPin = D5;   // GPIO14
+const int echoPin = D6;   // GPIO12
+
+int angle = 0;
+int increment = 5;  // Degrees to move per step
+bool scanning = true;
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Initialize servo
+  radarServo.attach(servoPin);
+  radarServo.write(0);
+  delay(1000);
+  
+  // Initialize ultrasonic sensor
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+  
+  // Connect to WiFi
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("");
+  Serial.print("Connected to ");
+  Serial.println(ssid);
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+  
+  // Setup web server
+  server.on("/", handleRoot);
+  server.on("/scan", handleScan);
+  server.on("/data", handleData);
+  server.begin();
+  Serial.println("HTTP server started");
+}
+
+void loop() {
+  server.handleClient();
+  
+  if (scanning) {
+    // Move servo
+    angle += increment;
+    if (angle >= 180 || angle <= 0) {
+      increment = -increment;
+    }
+    radarServo.write(angle);
+    
+    // Get distance
+    float distance = getDistance();
+    
+    // Print data (angle, distance)
+    Serial.print("Angle: ");
+    Serial.print(angle);
+    Serial.print("°, Distance: ");
+    Serial.print(distance);
+    Serial.println(" cm");
+    
+    delay(100);  // Adjust speed of scan
+  }
+}
+
+float getDistance() {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  
+  long duration = pulseIn(echoPin, HIGH);
+  float distance = duration * 0.034 / 2;  // Calculate distance in cm
+  
+  return distance;
+}
+
+void handleRoot() {
+  String html = R"=====(
+<!DOCTYPE html>
+<html>
+<head>
+  <title>ESP8266 Radar</title>
+  <style>
+    body { 
+      background: black; 
+      color: lime; 
+      font-family: monospace;
+      text-align: center;
+    }
+    #radar {
+      background: radial-gradient(circle, rgba(0,20,0,0.8) 0%, black 70%);
+      border: 2px solid lime;
+      border-radius: 50%;
+      margin: 20px auto;
+    }
+    .info { margin: 10px; }
+  </style>
+</head>
+<body>
+  <h1>➤ ESP8266 RADAR SYSTEM</h1>
+  <div class="info">Angle: <span id="angle">0</span>° | Distance: <span id="distance">0</span> cm</div>
+  <canvas id="radar" width="400" height="400"></canvas>
+  
+  <script>
+    const radar = document.getElementById('radar');
+    const ctx = radar.getContext('2d');
+    const centerX = radar.width / 2;
+    const centerY = radar.height / 2;
+    let prevAngle = 0;
+
+    // Draw radar grid
+    function drawGrid() {
+      ctx.strokeStyle = 'rgba(0, 255, 0, 0.3)';
+      ctx.lineWidth = 1;
+      
+      // Concentric circles (range rings)
+      for (let r = 0; r <= 4; r++) {
+        ctx.beginPath();
+        ctx.arc(centerX, centerY, r * 50, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.fillText((r * 50) + 'cm', centerX + r * 50 + 5, centerY);
+      }
+      
+      // Crosshairs
+      ctx.beginPath();
+      ctx.moveTo(centerX, 0);
+      ctx.lineTo(centerX, radar.height);
+      ctx.moveTo(0, centerY);
+      ctx.lineTo(radar.width, centerY);
+      ctx.stroke();
+    }
+
+    // Update radar with new data
+    function updateData(angle, distance) {
+      // Clear fading sweep
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.05)';
+      ctx.fillRect(0, 0, radar.width, radar.height);
+      
+      // Redraw grid
+      drawGrid();
+      
+      // Convert polar to cartesian coordinates
+      const radAngle = (angle - 90) * Math.PI / 180;
+      const maxRange = 200; // cm (adjust based on your sensor range)
+      const scaledDist = distance * (centerX / maxRange);
+      const x = centerX + scaledDist * Math.cos(radAngle);
+      const y = centerY + scaledDist * Math.sin(radAngle);
+      
+      // Draw sweep line
+      ctx.strokeStyle = 'rgba(0, 255, 0, 0.7)';
+      ctx.beginPath();
+      ctx.moveTo(centerX, centerY);
+      ctx.lineTo(x, y);
+      ctx.stroke();
+      
+      // Draw detected object
+      if (distance > 0 && distance < maxRange) {
+        ctx.fillStyle = 'lime';
+        ctx.beginPath();
+        ctx.arc(x, y, 5, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      
+      prevAngle = angle;
+    }
+
+    // Fetch data from ESP
+    function fetchData() {
+      fetch('/data')
+        .then(res => res.json())
+        .then(data => {
+          document.getElementById('angle').textContent = data.angle;
+          document.getElementById('distance').textContent = data.distance;
+          updateData(data.angle, data.distance);
+        });
+    }
+    
+    // Initialize
+    drawGrid();
+    setInterval(fetchData, 100);
+  </script>
+</body>
+</html>
+)=====";
+  
+  server.send(200, "text/html", html);
+}
+
+void handleScan() {
+  if (server.hasArg("cmd")) {
+    String cmd = server.arg("cmd");
+    if (cmd == "stop") scanning = false;
+    else if (cmd == "start") scanning = true;
+  }
+  server.send(200, "text/plain", "OK");
+}
+
+void handleData() {
+  String data = "{\"angle\":";
+  data += angle;
+  data += ",\"distance\":";
+  data += getDistance();
+  data += "}";
+  
+  server.send(200, "application/json", data);
+}
